@@ -3117,6 +3117,11 @@ static void fixup_expansion_var_collisions(cell *goal, unsigned num_vars_before,
 	pl_idx remap_from[MAX_VARS], remap_to[MAX_VARS];
 	unsigned nremaps = 0;
 
+	// A renamed variable is new to the whole clause, so it numbers past every one the clause had: the sub-parser can count fewer.
+
+	if (p2->cl->num_vars < num_vars_before)
+		p2->cl->num_vars = num_vars_before;
+
 	for (pl_idx i = 0; i < p2->cl->cidx; i++) {
 		cell *c = p2->cl->cells + i;
 
