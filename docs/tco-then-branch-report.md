@@ -15,6 +15,7 @@ parser.c a bit"). Re-verified against `1954a4e`.
 | 7. What a collector would free | **simulated** - 100% of frames in a recursive workload, 47% in chess; roots known |
 | 8. What a collector may move | **audited** - compact frames and slots, renumber indices, leave the heap in place |
 | 9. Whether to build it | **not now** - 7.7x memory for 3-23% time, a permanent tax, and nothing cheaper left |
+| 10. What the head rule covers for | **hypothesis, untested** - attribute and blackboard stores keep frame references and pin nothing; two fixes planned |
 | Addendum. Disjunction quadratic (#1106) | **landed** |
 
 Section 4 is the live one and was re-measured on `1954a4e`; its numbers
@@ -485,6 +486,10 @@ already unpinned. A gate would have to be settled before any such code runs
 - set, say, when a loaded clause can put an attribute - and would still
 leave the thread-queue case above to Logtalk.
 
+Section 10 offers a different reading of these five failures: they are not a
+gap in the rule, but two builtins that store terms without going through
+`set_var()`.
+
 Section 5's census puts a number on this rule. In `giso`'s parse it fires
 20 times a line against 4 for `pin_v`, and those two between them keep
 1.76M frames, so this section is the larger half of that memory and a fix
@@ -823,6 +828,127 @@ sweep taxes backtracking code 20% for almost nothing.
 6.47GB. An application of that shape is better written that way, and the
 measurements here are a better argument for writing it that way than for
 carrying a collector.
+
+## 10. What the head rule is covering for
+
+Written on `6a9f703e`, from reading the code; nothing in this section has
+been run yet.
+
+**The rule is broader than its binding needs.** The var-var head rule in
+`set_var()` pins the callee's frame whenever a head variable is bound to a
+variable in any other frame, and `push_frame()` copies `q->no_recov` onto the
+new frame so it is never recovered either. A binding from a young variable to
+an older one is harmless in itself - the WAM makes it all the time. The
+binding only matters when its target is in the current frame, the one a tail
+call would overwrite (the WAM's *unsafe variable*). So the wider rule must be
+protecting something else.
+
+**Two builtins store frame references and pin nothing.** Both clone a term
+with `clone_term_to_tmp()`, which turns every variable into a ref carrying its
+frame index (`src/heap.c`, the `FLAG_VAR_REF` branch), and keep the clone in
+malloc'd cells beyond the call:
+
+- `do_put_atts()` (`src/bif_atts.c`) hangs the clone on the attributed
+  variable's slot as its attribute list. freeze/2, dif/2, when/2, clpz and clpb
+  all store through it.
+- `bb_b_put` (`src/bif_bboard.c`) keeps the clone as a blackboard value until
+  backtracking. clpb's `b_setval/2` is built on it, and clpz stores
+  `'$clpz_current_propagator'` with it.
+
+A frame can only hang its own variables off an older variable through an
+attribute if it holds an older unbound variable. That is exactly the set of
+frames the head rule pins. So the rule has been covering the attribute store
+all along, as a side effect.
+
+**The failures fit.** Section 4's fifth attempt narrowed the rule after the
+section-3 pins and the cut-scope bug were fixed. Five tests still broke, and
+all five use these stores:
+
+| test | uses |
+|---|---|
+| `tests/issues/test0338` | clpb |
+| `tests/issues/test0369` | clpb |
+| `tests/issues/test0838` | clpz |
+| `tests/issues/test1061` | clpz |
+| `tests/issues/test1127` | dif/2, freeze/2 |
+
+This reading also explains `test1061`, which no `attrs_used` gate could fix:
+clpz can store propagator state on the blackboard before it puts its first
+attribute. That is plausible, not traced. The trail-frame-index experiment
+(`docs/trail-frame-index.md`: recover regardless of the pin, `test0338` fails)
+is consistent too, since clpb uses both stores.
+
+**It may be a live bug today.** A frame that never receives an older variable
+is not pinned. So `p :- b_setval(k, f(X)).` stores a ref into `p`'s frame,
+and that frame is recovered when `p` returns. The same may hold for a
+`freeze/2` on a local variable that then escapes through the blackboard. A
+two-line probe settles it either way.
+
+**Fix 1: pin at the stores, then narrow the rule.** Small; it is the fifth
+attempt plus two pins.
+
+- **Pin what the stores keep.** A stored clone is contiguous, so a linear scan
+  finds its refs. Pin every frame younger than the variable holding the value,
+  in `do_put_atts()` and `bb_b_put`. The other clone sites need auditing for
+  any that keep a clone past the call: `src/bif_tasks.c`,
+  `src/bif_threads.c`, and the ball in `src/bif_control.c`.
+- **Fire the var-var rule only when the target is in the current frame**
+  (`v_ctx >= q->st.cur_ctx`).
+- **Split `q->no_recov`.** It both vetoes a tail call and pins the callee's
+  frame. The var-var rule and `pin_query` justify only the veto: a callee
+  holding a ref to an older frame is safe to recover. Section 4's second
+  attempt tried this split before the stores were known.
+
+The fifth attempt already measured what this buys. `sum/3` and `sum2/3` ran
+in 3 frames where they took 200,003. Chess made 83,182 more tail calls and
+peaked at 63,382 fewer frames. `giso` would gain only in part: its `pin_v`
+and `pin_cur` escapes are genuine, and a pinned frame still strands every
+frame below it.
+
+A store this misses gives silent wrong answers, so check it against section
+6's oracle turned into an assertion. Abort whenever a frame being recovered
+or reused is reachable from the roots, counting attribute lists and
+blackboard values as roots. That finds a missed store directly rather than
+through a wrong answer. Then run `test0338` and Logtalk's
+`examples/threads/primes`, as `docs/norecov-notes.md` warns.
+
+**Fix 2: move escaping terms out of frames.** This is the one for `giso`.
+
+The WAM never pins an environment: anything that must outlive it is built on
+the heap. Trealla shares structure instead. A term built from a clause body
+is the clause's skeleton plus the index of the frame holding its variables,
+so a term that escapes into an older variable takes its frame with it.
+DEC-10 Prolog shared structure the same way and solved it with a global frame.
+
+Applied here: when a term escapes into an older variable, copy it to the heap
+and move its unbound variables to a global variable store that only
+backtracking reclaims. The frame's slot keeps a ref to the moved variable.
+Frames then never need pinning for an escape, and what escapes costs heap
+rather than frames. In `giso` that is about 2.5M heap cells in place of 89M
+slots, near the 844 MB of the failure-driven parse against 6.47 GB.
+
+It needs three things:
+
+- a variable store placed so that index order makes it the oldest frame, so
+  binding direction and `needs_trail()` work unchanged;
+- its allocation mark saved in choicepoints;
+- a spare cell flag marking a copied term as already global, so a term that
+  escapes again costs nothing. Without it, accumulators go quadratic.
+
+That is mostly `set_var()`, a copying routine and the store - far less than
+section 8's collector touches, and with no pauses. Worth it only after fix 1,
+and only if `giso`-shaped programs matter.
+
+**Not worth retrying:**
+
+- Freeing a returned frame in the middle of the stack (a free list over frame
+  indices) breaks the rule that index order is age order. The trail test, the
+  binding direction and every pin rule depend on that rule.
+- Section 9's verdict on a collector stands, and fix 2 gets most of what a
+  collector would, without its pauses or renumbering.
+
+**Order:** the probes first, to confirm the reading. Then fix 1 on a branch,
+under the assertion build. Then measure `giso` and decide on fix 2.
 
 ---
 
