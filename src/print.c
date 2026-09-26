@@ -512,6 +512,75 @@ size_t sprint_int(char *dst, size_t dstlen, pl_int n, int base)
 	return dst - save_dst;
 }
 
+// For a C library that misprints a double outright, as mingw-w64's printf on aarch64 does subnormals: the same
+// search over the exact value's digits, rounded here, and always in exponent form as %g gives a subnormal.
+
+static void format_double_exact(double num, char *res, size_t reslen)
+{
+	int e;
+	mpz_t n;
+	mp_int_init_uvalue(&n, (uint64_t)ldexp(frexp(fabs(num), &e), DBL_MANT_DIG));
+	e -= DBL_MANT_DIG;
+
+	// num is n*2^e, so n*5^-e*10^e for a negative e.
+
+	if (e < 0) {
+		mpz_t p;
+		mp_int_init(&p);
+		mp_int_expt_value(5, -e, &p);
+		mp_int_mul(&n, &p, &n);
+		mp_int_clear(&p);
+	} else {
+		mp_int_mul_pow2(&n, e, &n);
+		e = 0;
+	}
+
+	char digits[1024];							// at most 803: 2^53*5^1126
+	mp_int_to_string(&n, 10, digits, sizeof(digits));
+	mp_int_clear(&n);
+	const int len = strlen(digits);
+
+	for (int prec = 1; prec <= 17; prec++) {
+		char d[17];
+		int exp10 = e + len - 1;
+
+		for (int i = 0; i < prec; i++)
+			d[i] = i < len ? digits[i] : '0';
+
+		// To nearest, ties to even: a 5 followed by anything but zeros is past halfway.
+
+		bool up = false;
+
+		if ((prec < len) && (digits[prec] >= '5'))
+			up = (digits[prec] > '5') || ((int)strspn(digits+prec+1, "0") < (len-prec-1)) || ((d[prec-1] - '0') & 1);
+
+		if (up) {
+			int i = prec - 1;
+
+			while ((i >= 0) && (d[i] == '9'))
+				d[i--] = '0';
+
+			if (i >= 0)
+				d[i]++;
+			else {
+				d[0] = '1';
+				exp10++;
+			}
+		}
+
+		int n = prec;
+
+		while ((n > 1) && (d[n-1] == '0'))
+			n--;
+
+		snprintf(res, reslen, "%s%c%s%.*se%c%02d", num < 0 ? "-" : "", d[0], n > 1 ? "." : "", n-1, d+1,
+			exp10 < 0 ? '-' : '+', abs(exp10));
+
+		if (strtod(res, NULL) == num)
+			return;
+	}
+}
+
 // The fewest significant digits that read back as the same double: 1.0e-20, not 9.999999999999999e-21.
 // A normal double's shortest form of up to 15 digits is exactly what %.15g gives (DBL_DIG), so the
 // search starts there; a subnormal has fewer bits of precision, so it starts at one.
@@ -524,6 +593,8 @@ static void format_double(double num, char *res, size_t reslen)
 		if (strtod(res, NULL) == num)
 			return;
 	}
+
+	format_double_exact(num, res, reslen);
 }
 
 // Make sure we have a trailing dot if needed...
