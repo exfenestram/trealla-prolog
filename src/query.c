@@ -1322,6 +1322,11 @@ void undo_me(query *q)
 		const trail *tr = pop_trail(q);
 
 		if (is_frame_layout(tr)) {
+			// A frame backtracking discards needs no layout, and may be a later call's with the index: keep that one's.
+
+			if (tr->val_ctx >= ch->st.fp)
+				continue;
+
 			frame *fl = GET_FRAME(tr->val_ctx);
 			fl->actual_slots = tr->var_num & ~TRAIL_FRAME_LAYOUT;
 			fl->ovf = tr->attrs ? (slot*)tr->attrs : q->slot_pages->slots;
