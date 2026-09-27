@@ -999,9 +999,10 @@ static bool is_dump_spine_var(query *q, cell *c, pl_ctx c_ctx)
 // Follow var-to-var aliases only. Full deref would walk into a binding
 // like Y = -Y and lose the variable identity needed for naming (test0842);
 // skipping deref entirely misses Cor.3 leftmost-alias selection (#1091).
+// A '_' is followed too: it may be bound to a variable the list names.
 static bool var_root_slot(query *q, cell *c, pl_ctx c_ctx, uint32_t *var_num, pl_ctx *out_ctx)
 {
-	if (!is_var(c) || is_anon(c))
+	if (!is_var(c))
 		return false;
 
 	if (is_ref(c))
@@ -1066,14 +1067,15 @@ static bool dump_variable(query *q, cell *c, pl_ctx c_ctx, bool running)
 		pl_ctx v_root_ctx;
 		bool v_ok;
 
-		if (running)
+		if (!is_var(v) || is_anon(v))
+			v_ok = false;
+		else if (running)
 			v_ok = var_root_slot(q, v, v_ctx, &v_vn, &v_root_ctx);
-		else if (is_var(v) && !is_anon(v)) {
+		else {
 			v_ok = true;
 			v_vn = v->var_num;
 			v_root_ctx = is_ref(v) ? v->val_ctx : v_ctx;
-		} else
-			v_ok = false;
+		}
 
 		if (v_ok && (v_vn == c_vn) && (v_root_ctx == c_root_ctx)) {
 			emit(q, C_STR(q, name));
