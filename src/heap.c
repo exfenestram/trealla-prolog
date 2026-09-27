@@ -179,7 +179,66 @@ static bool cycles_back(const query *q, const cell *c, pl_ctx c_ctx)
 	return q->clone_root && (c == q->clone_root) && (c_ctx == q->clone_root_ctx);
 }
 
-static void record_clone_def(query *q, pl_idx slot_nbr, pl_idx tmp_offset);
+// A variable as a map key. Its frame and slot must not share bits, or two variables become one, as ctx*100+var_num
+// once made a frame's hundredth variable the next frame's first. A 64-bit pointer holds the pair; a 32-bit one points at it.
+
+static const void *var_key(uint64_t *buf, pl_ctx ctx, unsigned var_num)
+{
+	*buf = ((uint64_t)ctx << 32) | var_num;
+#if SIZE_MAX > UINT32_MAX
+	return (const void*)(size_t)*buf;
+#else
+	return buf;
+#endif
+}
+
+#if SIZE_MAX > UINT32_MAX
+static skiplist *var_map_create(void)
+{
+	return sl_create(NULL, NULL, NULL);
+}
+
+static bool var_map_app(skiplist *m, const void *k, const void *v)
+{
+	return sl_app(m, k, v);
+}
+#else
+static int var_key_cmp(const void *k1, const void *k2, const void *p, void *l)
+{
+	(void)p; (void)l;
+	const uint64_t a = *(const uint64_t*)k1, b = *(const uint64_t*)k2;
+	return a < b ? -1 : a > b ? 1 : 0;
+}
+
+static void var_key_del(void *k, void *v, const void *p)
+{
+	(void)v; (void)p;
+	TPL_free(k);
+}
+
+static skiplist *var_map_create(void)
+{
+	return sl_create(var_key_cmp, var_key_del, NULL);
+}
+
+static bool var_map_app(skiplist *m, const void *k, const void *v)
+{
+	uint64_t *copy = TPL_malloc(sizeof(uint64_t));
+
+	if (!copy)
+		return false;
+
+	*copy = *(const uint64_t*)k;
+
+	if (sl_app(m, copy, v))
+		return true;
+
+	TPL_free(copy);
+	return false;
+}
+#endif
+
+static void record_clone_def(query *q, pl_ctx ctx, unsigned var_num, pl_idx tmp_offset);
 
 // Note: convert vars to refs
 // Note: doesn't increment ref counts
@@ -262,7 +321,7 @@ static cell *clone_term_to_tmp_internal(query *q, cell *p1, pl_ctx p1_ctx, unsig
 			// where, so a later back-edge to it (issue #1121) has something
 			// to bind to instead of coming out dangling.
 			if (q->close_cycles && t_was_var && !both && is_compound(t))
-				record_clone_def(q, get_ordered_slot_num(q, t_owning_ctx, t_var_num), tmp_heap_used(q));
+				record_clone_def(q, t_owning_ctx, t_var_num, tmp_heap_used(q));
 
 			if (both)
 				q->cycle_error = q->cycle_dropped = true;
@@ -475,30 +534,32 @@ cell *append_to_tmp(query *q, cell *p1, pl_ctx p1_ctx)
 // close_cycles only (see internal.h): first-write-wins, so a slot keeps
 // the offset of its own definition rather than some later revisit of it.
 
-static void record_clone_def(query *q, pl_idx slot_nbr, pl_idx tmp_offset)
+static void record_clone_def(query *q, pl_ctx ctx, unsigned var_num, pl_idx tmp_offset)
 {
-	const void *v;
+	uint64_t buf;
+	const void *k = var_key(&buf, ctx, var_num), *v;
 
-	if (q->clone_defs && sl_get(q->clone_defs, (void*)(size_t)slot_nbr, &v))
+	if (q->clone_defs && sl_get(q->clone_defs, k, &v))
 		return;
 
 	if (!q->clone_defs)
-		q->clone_defs = sl_create(NULL, NULL, NULL);
+		q->clone_defs = var_map_create();
 
-	sl_app(q->clone_defs, (void*)(size_t)slot_nbr, (void*)(size_t)tmp_offset);
+	var_map_app(q->clone_defs, k, (void*)(size_t)tmp_offset);
 }
 
-static int accum_slot(query *q, size_t slot_nbr, unsigned var_num)
+static int accum_slot(query *q, pl_ctx ctx, unsigned var_num, unsigned new_var_num)
 {
-	const void *vnbr;
+	uint64_t buf;
+	const void *k = var_key(&buf, ctx, var_num), *vnbr;
 
-	if (q->vars && sl_get(q->vars, (void*)slot_nbr, &vnbr))
+	if (q->vars && sl_get(q->vars, k, &vnbr))
 		return (unsigned)(size_t)vnbr;
 
 	if (!q->vars)
-		q->vars = sl_create(NULL, NULL, NULL);
+		q->vars = var_map_create();
 
-	sl_app(q->vars, (void*)slot_nbr, (void*)(size_t)var_num);
+	var_map_app(q->vars, k, (void*)(size_t)new_var_num);
 	return -1;
 }
 
@@ -556,12 +617,11 @@ static bool copy_vars(query *q, cell *c, bool copy_attrs, cell *from, pl_ctx fro
 			}
 		} else {
 			const frame *f = GET_FRAME(c->val_ctx);
-			// NB. get_ordered_slot_num is pure arithmetic (no deref), so
-			// it is safe even when c->val_ctx names a long-dead frame, as
-			// happens when rebasing an imported (detached) term image.
-			// Only consult the slot itself when attributes are wanted:
+			// NB. The key is pure arithmetic (no deref), so it is safe
+			// even when c->val_ctx names a long-dead frame, as happens
+			// when rebasing an imported (detached) term image. Only
+			// consult the slot itself when attributes are wanted:
 			// dereferencing a dead frame's slot is undefined.
-			const size_t slot_nbr = get_ordered_slot_num(q, c->val_ctx, c->var_num);
 			cell *attrs = NULL;
 
 			if (copy_attrs) {
@@ -570,7 +630,7 @@ static bool copy_vars(query *q, cell *c, bool copy_attrs, cell *from, pl_ctx fro
 			}
 			int var_num;
 
-			if ((var_num = accum_slot(q, slot_nbr, q->varno)) == -1) {
+			if ((var_num = accum_slot(q, c->val_ctx, c->var_num, q->varno)) == -1) {
 				var_num = q->varno++;
 				cnt++;
 
@@ -819,10 +879,9 @@ static void close_clone_cycles(query *q, cell *tmp2)
 		void *offset_v;
 
 		while (sl_next(iter, &offset_v)) {
-			pl_idx slot_nbr = (pl_idx)(size_t)sl_key(iter);
 			const void *var_v;
 
-			if (!q->vars || !sl_get(q->vars, (void*)(size_t)slot_nbr, &var_v))
+			if (!q->vars || !sl_get(q->vars, sl_key(iter), &var_v))
 				continue;
 
 			unsigned var_num = (unsigned)(size_t)var_v;
