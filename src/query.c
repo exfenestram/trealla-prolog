@@ -1472,8 +1472,14 @@ static bool reuse_frame(query *q, unsigned num_vars)
 	const frame *f_new = GET_NEW_FRAME();
 	frame *f_cur = GET_CURR_FRAME();
 
-	for (unsigned i = 0; i < f_cur->actual_slots; i++)
-		unshare_cell(&get_slot(q, f_cur, i)->c);
+	for (unsigned i = 0; i < f_cur->actual_slots; i++) {
+		slot *e = get_slot(q, f_cur, i);
+
+		if (is_managed(&e->c)) {
+			unshare_cell_(&e->c);
+			memset(e, 0, sizeof(slot));
+		}
+	}
 
 	f_cur->initial_slots = f_cur->actual_slots = num_vars;
 	f_cur->no_recov = false;
@@ -1483,10 +1489,19 @@ static bool reuse_frame(query *q, unsigned num_vars)
 		restart_run(q, f_cur);
 
 	slot *to = f_cur->slots;
-	const slot *from = f_new->slots;
+	slot *from = f_new->slots;
 
-	for (unsigned i = 0; i < num_vars; i++)
+	// A move, not a copy: an old trail entry naming the index the new frame had must find no counted value left past
+	// this frame to release again. Released slots are left empty for the same reason, as trim_frame() leaves them.
+
+	const slot *to_end = to + num_vars;
+
+	for (unsigned i = 0; i < num_vars; i++) {
 		to[i] = from[i];
+
+		if (((from + i) >= to_end) && is_managed(&from[i].c))
+			memset(from + i, 0, sizeof(slot));
+	}
 
 	// Head unification trailed the reference-counted values it bound in the new frame, and this frame's own entries
 	// named the values just released: point the one here and drop the other, so backtracking releases each once.
