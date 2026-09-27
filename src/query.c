@@ -1279,6 +1279,18 @@ static void rewind_slots(query *q, slot *run)
 	q->st.sp = run;
 }
 
+// Back to frame f's heap mark: one in an older page frees the newer, where allocation would otherwise carry on unmarked.
+
+static void wind_heap(query *q, const frame *f)
+{
+	const bool other_page = q->st.hp_num != f->hp_num;
+	q->st.hp = f->hp;
+	q->st.hp_num = f->hp_num;
+
+	if (other_page)
+		trim_heap(q);
+}
+
 static void trim_frame(query *q, const frame *f)
 {
 	for (unsigned i = 0; i < f->actual_slots; i++) {
@@ -2030,8 +2042,7 @@ static bool resume_frame(query *q)
 		&& !resume_any_choices(q, f)
 		) {
 		q->total_recovs++;
-		q->st.hp = f->hp;
-		q->st.hp_num = f->hp_num;
+		wind_heap(q, f);
 		trim_frame(q, f);
 	}
 
