@@ -1481,20 +1481,10 @@ static void print_iso_list_canonical(query *q, cell *c, pl_ctx c_ctx, int runnin
 		cell *head = PROLOG_LIST_HEAD(c);
 		pl_ctx head_ctx = c_ctx;
 		head = deref_if(q, running, head, &head_ctx);
-		bool special_op = false;
 
-		if (is_interned(head)) {
-			unsigned specifier = 0;
-			unsigned priority = match_op(q->st.m, C_STR(q, head), &specifier, get_arity(head));
-			special_op = (priority >= 1000);
-		}
+		// Written without operators, an element needs no parentheses: '.'(','(1,2),[]), not '.'((','(1,2)),[]).
 
-		bool parens = is_compound(head) && special_op;
-		if (parens) {  emit(q, "("); q->last_thing = WAS_OTHER; }
-		q->parens = parens;
 		print_term_dispatch(q, head, head_ctx, running, -1, depth+1, NULL);
-		q->parens = false;
-		if (parens) { emit(q, ")"); }
 
 		c = PROLOG_LIST_TAIL(c);
 		c = deref_if(q, running, c, &c_ctx);
