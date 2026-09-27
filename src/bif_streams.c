@@ -2319,7 +2319,11 @@ bool do_read_term(query *q, stream *str, cell *p1, pl_ctx p1_ctx, cell *p2, pl_c
 	cell *tmp = alloc_heap(q, str->p->cl->cidx-1);
 	CHECKED(tmp);
 	dup_cells(tmp, str->p->cl->cells, str->p->cl->cidx-1);
-	bool ok = unify(q, p1, p1_ctx, tmp, q->st.cur_ctx);
+
+	// A term that is only a variable may be bound by now, by the unifications above.
+
+	cell *t = deref(q, tmp, q->st.cur_ctx);
+	bool ok = unify(q, p1, p1_ctx, t, q->latest_ctx);
 	clear_clause(str->p->cl);
 	return ok;
 }
