@@ -16,6 +16,16 @@
 #include <unistd.h>
 #endif
 
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+
+// See the matching comment in bif_os.c: fork() is sandboxed or outright
+// prohibited on every Apple platform except plain macOS.
+#if defined(__APPLE__) && !TARGET_OS_OSX
+#define TPL_NO_PROCESS_SPAWN 1
+#endif
+
 #if !defined(_WIN32) && !defined(__wasi__)
 #define USE_SYSLOG 1
 #include <syslog.h>
@@ -253,6 +263,9 @@ static bool bif_posix_getppid_1(query *q)
 static bool bif_posix_fork_1(query *q)
 {
 	GET_FIRST_ARG(p1,var);
+#if defined(TPL_NO_PROCESS_SPAWN)
+	return throw_error(q, p1, p1_ctx, "resource_error", "process_creation");
+#else
 	cell tmp;
 #if !defined(_WIN32) && !defined(__wasi__)
 	signal(SIGCHLD, SIG_IGN);
@@ -262,6 +275,7 @@ static bool bif_posix_fork_1(query *q)
 	make_int(&tmp, -1);
 #endif
 	return unify(q, p1, p1_ctx, &tmp, q->st.cur_ctx);
+#endif
 }
 
 

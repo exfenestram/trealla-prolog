@@ -13,6 +13,18 @@
 
 #if defined(__APPLE__)
 #include <Availability.h>
+#include <TargetConditionals.h>
+#endif
+
+// iOS, iPadOS, visionOS and watchOS all sandbox or (for watchOS) outright
+// prohibit fork()/posix_spawn(). Rather than dropping shell/1,2, popen/4 and
+// process_create/3 from the builtin table on those platforms - which turns a
+// call into a confusing existence_error(procedure,_) - they stay registered
+// and throw resource_error(process_creation) instead, everywhere the real
+// implementation below would otherwise have run. Only TARGET_OS_OSX (plain
+// macOS) keeps the real fork()/system()/popen()/posix_spawnp() calls.
+#if defined(__APPLE__) && !TARGET_OS_OSX
+#define TPL_NO_PROCESS_SPAWN 1
 #endif
 
 #if !defined(_WIN32) && !defined(__wasi__) && !defined(__ANDROID__) && !defined(__riscos__)
@@ -166,7 +178,7 @@ uint64_t monotonic_time_in_usec(void)
 	return (uint64_t)(now.tv_sec * 1000 * 1000) + (now.tv_nsec / 1000);
 }
 
-#ifndef __wasi__
+#if !defined(__wasi__) && !defined(TPL_NO_PROCESS_SPAWN)
 static bool bif_shell_1(query *q)
 {
 	GET_FIRST_ARG(p1,source_sink);
@@ -192,6 +204,18 @@ static bool bif_shell_2(query *q)
 	cell tmp;
 	make_int(&tmp, status);
 	return unify(q, p2, p2_ctx, &tmp, q->st.cur_ctx);
+}
+#elif defined(TPL_NO_PROCESS_SPAWN)
+static bool bif_shell_1(query *q)
+{
+	GET_FIRST_ARG(p1,source_sink);
+	return throw_error(q, p1, p1_ctx, "resource_error", "process_creation");
+}
+
+static bool bif_shell_2(query *q)
+{
+	GET_FIRST_ARG(p1,source_sink);
+	return throw_error(q, p1, p1_ctx, "resource_error", "process_creation");
 }
 #else
 static bool bif_shell_1(query *q)
@@ -735,7 +759,7 @@ static bool bif_get_unbuffered_char_1(query *q)
 	return unify(q, p1, p1_ctx, &tmp, q->st.cur_ctx);
 }
 
-#if !defined(_WIN32) && !defined(__wasi__)
+#if !defined(_WIN32) && !defined(__wasi__) && !defined(TPL_NO_PROCESS_SPAWN)
 static bool bif_popen_4(query *q)
 {
 	GET_FIRST_ARG(p1,source_sink);
@@ -892,11 +916,23 @@ static bool bif_pclose_1(query *q)
 	stream_close(q, n);
 	return true;
 }
+#elif defined(TPL_NO_PROCESS_SPAWN)
+static bool bif_popen_4(query *q)
+{
+	GET_FIRST_ARG(p1,source_sink);
+	return throw_error(q, p1, p1_ctx, "resource_error", "process_creation");
+}
+
+static bool bif_pclose_1(query *q)
+{
+	GET_FIRST_ARG(pstr,stream);
+	return throw_error(q, pstr, pstr_ctx, "resource_error", "process_creation");
+}
 #endif
 
 char **g_envp = NULL;		// set by the front end, if there is one
 
-#if !defined(_WIN32) && !defined(__wasi__) && !defined(__ANDROID__) && !defined(__riscos__)
+#if !defined(_WIN32) && !defined(__wasi__) && !defined(__ANDROID__) && !defined(__riscos__) && !defined(TPL_NO_PROCESS_SPAWN)
 
 // pipe(Stream, StreamOptions): only type(+Type) and encoding(+Encoding) are
 // recognised, the same subset SWI-Prolog documents for SICStus compatibility
@@ -1400,6 +1436,30 @@ static bool bif_process_kill_1(query *q)
 	kill(pid, SIGKILL);
 	return true;
 }
+#elif defined(TPL_NO_PROCESS_SPAWN)
+static bool bif_process_create_3(query *q)
+{
+	GET_FIRST_ARG(p1,atom);
+	return throw_error(q, p1, p1_ctx, "resource_error", "process_creation");
+}
+
+static bool bif_process_wait_3(query *q)
+{
+	GET_FIRST_ARG(p1,integer);
+	return throw_error(q, p1, p1_ctx, "resource_error", "process_creation");
+}
+
+static bool bif_process_kill_2(query *q)
+{
+	GET_FIRST_ARG(p1,integer);
+	return throw_error(q, p1, p1_ctx, "resource_error", "process_creation");
+}
+
+static bool bif_process_kill_1(query *q)
+{
+	GET_FIRST_ARG(p1,integer);
+	return throw_error(q, p1, p1_ctx, "resource_error", "process_creation");
+}
 #endif
 
 builtins g_os_bifs[] =
@@ -1426,14 +1486,14 @@ builtins g_os_bifs[] =
 	{"$tty_size", 2, bif_sys_tty_size_2, "-integer,-integer", false, false, BLAH},
 #endif
 
-#if !defined(_WIN32) && !defined(__wasi__) && !defined(__ANDROID__) && !defined(__riscos__)
+#if (!defined(_WIN32) && !defined(__wasi__) && !defined(__ANDROID__) && !defined(__riscos__)) || defined(TPL_NO_PROCESS_SPAWN)
 	{"process_create", 3, bif_process_create_3, "+atom,+list,+list", false, false, BLAH},
 	{"$process_wait", 3, bif_process_wait_3, "+integer,-term,+list", false, false, BLAH},
 	{"process_kill", 2, bif_process_kill_2, "+integer,+integer", false, false, BLAH},
 	{"process_kill", 1, bif_process_kill_1, "+integer", false, false, BLAH},
 #endif
 
-#if !defined(_WIN32) && !defined(__wasi__)
+#if (!defined(_WIN32) && !defined(__wasi__)) || defined(TPL_NO_PROCESS_SPAWN)
 	{"popen", 4, bif_popen_4, "+source_sink,+atom,--stream,+list", false, false, BLAH},
 	{"pclose", 1, bif_pclose_1, "+stream", false, false, BLAH},
 #endif
