@@ -1,0 +1,4 @@
+module CTrealla {
+	header "trealla.h"
+	export *
+}
